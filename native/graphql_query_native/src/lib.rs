@@ -1,8 +1,10 @@
-use apollo_compiler::ast::{Definition, Document, Selection};
+use apollo_compiler::ast::{Definition, Document, Selection, Value};
+use apollo_compiler::executable;
 use apollo_compiler::validation::DiagnosticList;
 use apollo_compiler::validation::Valid;
 use apollo_compiler::ExecutableDocument;
 use apollo_compiler::Schema;
+use apollo_compiler::parser::SourceMap;
 use std::collections::HashSet;
 
 use regex::Regex;
@@ -169,6 +171,83 @@ fn diagnostics_to_validation_errors(diagnostics: DiagnosticList) -> Vec<Validati
         .collect()
 }
 
+fn check_deprecated_fields(document: &ExecutableDocument) -> Vec<ValidationError> {
+    let mut warnings = Vec::new();
+
+    // Walk all operations
+    for operation in document.operations.iter() {
+        check_selection_set_deprecated(
+            &operation.selection_set,
+            &document.sources,
+            &mut warnings,
+        );
+    }
+
+    // Walk all fragments
+    for (_, fragment) in &document.fragments {
+        check_selection_set_deprecated(
+            &fragment.selection_set,
+            &document.sources,
+            &mut warnings,
+        );
+    }
+
+    warnings
+}
+
+fn check_selection_set_deprecated(
+    selection_set: &executable::SelectionSet,
+    sources: &SourceMap,
+    warnings: &mut Vec<ValidationError>,
+) {
+    for selection in &selection_set.selections {
+        match selection {
+            executable::Selection::Field(field) => {
+                if let Some(deprecated_dir) = field.definition.directives.get("deprecated") {
+                    let reason = deprecated_dir
+                        .arguments
+                        .iter()
+                        .find(|arg| arg.name == "reason")
+                        .and_then(|arg| match arg.value.as_ref() {
+                            Value::String(s) => Some(s.clone()),
+                            _ => None,
+                        });
+
+                    let message = match reason {
+                        Some(reason) => {
+                            format!("deprecated field: `{}` - {}", field.name, reason)
+                        }
+                        None => format!("deprecated field: `{}`", field.name),
+                    };
+
+                    let locations = field
+                        .location()
+                        .and_then(|loc| loc.line_column(sources))
+                        .map(|lc| {
+                            vec![Location {
+                                line: lc.line,
+                                column: lc.column,
+                            }]
+                        })
+                        .unwrap_or_default();
+
+                    warnings.push(ValidationError { message, locations });
+                }
+
+                // Recurse into nested selection sets
+                check_selection_set_deprecated(&field.selection_set, sources, warnings);
+            }
+            executable::Selection::InlineFragment(inline_frag) => {
+                check_selection_set_deprecated(&inline_frag.selection_set, sources, warnings);
+            }
+            executable::Selection::FragmentSpread(_) => {
+                // Fragment spreads reference named fragments; those are checked
+                // via the document.fragments loop in check_deprecated_fields
+            }
+        }
+    }
+}
+
 fn extract_fragments_from_selection_set(selections: &[Selection], fragments: &mut HashSet<String>) {
     for selection in selections {
         match selection {
@@ -292,9 +371,22 @@ fn validate_query_with_schema(
 ) -> Result<rustler::Atom, Vec<ValidationError>> {
     let schema = parse_schema_maybe_federation(&schema, &schema_path, federation)?;
 
-    ExecutableDocument::parse_and_validate(&schema, query, path)
-        .map(|_| atoms::ok())
-        .map_err(|diagnostics| diagnostics_to_validation_errors(diagnostics.errors))
+    match ExecutableDocument::parse_and_validate(&schema, query, path) {
+        Ok(valid_doc) => {
+            let deprecation_warnings = check_deprecated_fields(&valid_doc);
+            if deprecation_warnings.is_empty() {
+                Ok(atoms::ok())
+            } else {
+                Err(deprecation_warnings)
+            }
+        }
+        Err(with_errors) => {
+            let mut errors = diagnostics_to_validation_errors(with_errors.errors);
+            let deprecation_warnings = check_deprecated_fields(&with_errors.partial);
+            errors.extend(deprecation_warnings);
+            Err(errors)
+        }
+    }
 }
 
 #[rustler::nif]
