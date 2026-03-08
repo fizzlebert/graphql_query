@@ -182,6 +182,88 @@ defmodule GraphqlQuery.ValidatorTest do
     end
   end
 
+  describe "validate/1 with deprecated fields" do
+    test "deprecated field with reason produces warning" do
+      query = "query GetUser { user { id legacy_id } }"
+      document = Document.new(query, schema: Test.Schema)
+
+      assert {:error, errors} = Validator.validate(document)
+
+      deprecated_error = Enum.find(errors, &(&1.message =~ "deprecated field"))
+      assert deprecated_error != nil
+      assert deprecated_error.message =~ "deprecated field: `legacy_id`"
+      assert deprecated_error.message =~ "use id instead"
+    end
+
+    test "deprecated field without reason produces warning" do
+      query = "query GetUser { user { id old_email } }"
+      document = Document.new(query, schema: Test.Schema)
+
+      assert {:error, errors} = Validator.validate(document)
+
+      deprecated_error = Enum.find(errors, &(&1.message =~ "deprecated field"))
+      assert deprecated_error != nil
+      assert deprecated_error.message =~ "deprecated field: `old_email`"
+    end
+
+    test "non-deprecated fields pass validation with schema" do
+      query = "query GetUser { user { id name email } }"
+      document = Document.new(query, schema: Test.Schema)
+
+      assert :ok = Validator.validate(document)
+    end
+
+    test "deprecated field warning includes location" do
+      query = "query GetUser { user { id legacy_id } }"
+      document = Document.new(query, schema: Test.Schema)
+
+      assert {:error, errors} = Validator.validate(document)
+
+      deprecated_error = Enum.find(errors, &(&1.message =~ "deprecated field"))
+      assert deprecated_error != nil
+      assert [%{line: _, column: _} | _] = deprecated_error.locations
+    end
+
+    test "multiple deprecated fields produce multiple warnings" do
+      query = "query GetUser { user { id legacy_id old_email } }"
+      document = Document.new(query, schema: Test.Schema)
+
+      assert {:error, errors} = Validator.validate(document)
+
+      deprecated_errors = Enum.filter(errors, &(&1.message =~ "deprecated field"))
+      assert length(deprecated_errors) == 2
+
+      messages = Enum.map(deprecated_errors, & &1.message)
+      assert Enum.any?(messages, &(&1 =~ "legacy_id"))
+      assert Enum.any?(messages, &(&1 =~ "old_email"))
+    end
+
+    test "deprecated field in fragment produces warning" do
+      fragment =
+        Document.new("fragment UserFields on User { id legacy_id }",
+          type: :fragment,
+          schema: Test.Schema
+        )
+
+      assert {:error, errors} = Validator.validate(fragment)
+
+      deprecated_error = Enum.find(errors, &(&1.message =~ "deprecated field"))
+      assert deprecated_error != nil
+      assert deprecated_error.message =~ "deprecated field: `legacy_id`"
+      assert deprecated_error.message =~ "use id instead"
+    end
+
+    test "query with both unused variable and deprecated field produces both errors" do
+      query = "query GetUser($unused: String) { user { id legacy_id } }"
+      document = Document.new(query, schema: Test.Schema)
+
+      assert {:error, errors} = Validator.validate(document)
+
+      assert Enum.any?(errors, &(&1.message =~ "unused variable"))
+      assert Enum.any?(errors, &(&1.message =~ "deprecated field"))
+    end
+  end
+
   describe "error handling and edge cases" do
     test "handles Document with complex nested structure" do
       query = """

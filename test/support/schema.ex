@@ -13,6 +13,8 @@ defmodule Test.Schema do
       id: ID!
       name: String!
       email: String!
+      legacy_id: Int! @deprecated(reason: "use id instead")
+      old_email: String! @deprecated
     }
     """s
   end
