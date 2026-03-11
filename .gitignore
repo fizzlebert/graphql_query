@@ -26,3 +26,6 @@ native/*/target
 priv/**/*.so
 checksum*
 priv/plts
+
+# nix
+.direnv
