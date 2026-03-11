@@ -1,10 +1,10 @@
 use apollo_compiler::ast::{Definition, Document, Selection, Value};
 use apollo_compiler::executable;
+use apollo_compiler::parser::SourceMap;
 use apollo_compiler::validation::DiagnosticList;
 use apollo_compiler::validation::Valid;
 use apollo_compiler::ExecutableDocument;
 use apollo_compiler::Schema;
-use apollo_compiler::parser::SourceMap;
 use std::collections::HashSet;
 
 use regex::Regex;
@@ -172,80 +172,53 @@ fn diagnostics_to_validation_errors(diagnostics: DiagnosticList) -> Vec<Validati
 }
 
 fn check_deprecated_fields(document: &ExecutableDocument) -> Vec<ValidationError> {
-    let mut warnings = Vec::new();
+    let operations = document.operations.iter().flat_map(|op| {
+        op.all_fields(document)
+            .filter_map(|field| build_deprecation_warning(field, &document.sources))
+    });
 
-    // Walk all operations
-    for operation in document.operations.iter() {
-        check_selection_set_deprecated(
-            &operation.selection_set,
-            &document.sources,
-            &mut warnings,
-        );
-    }
+    let fragments = document.fragments.values().flat_map(|fragment| {
+        fragment
+            .selection_set
+            .all_fields(document)
+            .filter_map(|field| build_deprecation_warning(field, &document.sources))
+    });
 
-    // Walk all fragments
-    for (_, fragment) in &document.fragments {
-        check_selection_set_deprecated(
-            &fragment.selection_set,
-            &document.sources,
-            &mut warnings,
-        );
-    }
-
-    warnings
+    operations.chain(fragments).collect()
 }
 
-fn check_selection_set_deprecated(
-    selection_set: &executable::SelectionSet,
+fn build_deprecation_warning(
+    field: &apollo_compiler::Node<executable::Field>,
     sources: &SourceMap,
-    warnings: &mut Vec<ValidationError>,
-) {
-    for selection in &selection_set.selections {
-        match selection {
-            executable::Selection::Field(field) => {
-                if let Some(deprecated_dir) = field.definition.directives.get("deprecated") {
-                    let reason = deprecated_dir
-                        .arguments
-                        .iter()
-                        .find(|arg| arg.name == "reason")
-                        .and_then(|arg| match arg.value.as_ref() {
-                            Value::String(s) => Some(s.clone()),
-                            _ => None,
-                        });
+) -> Option<ValidationError> {
+    let deprecated_dir = field.definition.directives.get("deprecated")?;
 
-                    let message = match reason {
-                        Some(reason) => {
-                            format!("deprecated field: `{}` - {}", field.name, reason)
-                        }
-                        None => format!("deprecated field: `{}`", field.name),
-                    };
+    let reason = deprecated_dir
+        .arguments
+        .iter()
+        .find(|arg| arg.name == "reason")
+        .and_then(|arg| match arg.value.as_ref() {
+            Value::String(s) => Some(s.as_str()),
+            _ => None,
+        });
 
-                    let locations = field
-                        .location()
-                        .and_then(|loc| loc.line_column(sources))
-                        .map(|lc| {
-                            vec![Location {
-                                line: lc.line,
-                                column: lc.column,
-                            }]
-                        })
-                        .unwrap_or_default();
+    let message = match reason {
+        Some(reason) => format!("deprecated field: `{}` - {}", field.name, reason),
+        None => format!("deprecated field: `{}`", field.name),
+    };
 
-                    warnings.push(ValidationError { message, locations });
-                }
+    let locations = field
+        .location()
+        .and_then(|loc| loc.line_column(sources))
+        .map(|lc| {
+            vec![Location {
+                line: lc.line,
+                column: lc.column,
+            }]
+        })
+        .unwrap_or_default();
 
-                // Recurse into nested selection sets
-                check_selection_set_deprecated(&field.selection_set, sources, warnings);
-            }
-            executable::Selection::InlineFragment(inline_frag) => {
-                check_selection_set_deprecated(&inline_frag.selection_set, sources, warnings);
-            }
-            executable::Selection::FragmentSpread(_) => {
-                // Fragment spreads reference named fragments; those are checked
-                // via the document.fragments loop in check_deprecated_fields
-            }
-        }
-    }
+    Some(ValidationError { message, locations })
 }
 
 fn extract_fragments_from_selection_set(selections: &[Selection], fragments: &mut HashSet<String>) {
